@@ -27,7 +27,18 @@ DRY_RUN = os.getenv("DRY_RUN", "") == "1"
 
 # Модель оценивает каждого кандидата 0-100. Ниже порога — не постим вообще,
 # лучше пропустить слот, чем залить проходную новость.
+# Общий порог. Переопределяется переменной MIN_SCORE в Railway.
 MIN_SCORE = int(os.getenv("MIN_SCORE", "72"))
+
+# Порог по вертикалям. Спорт живёт по календарю: в перерыв на сборные
+# или в будний день крупных событий может не быть неделями, и слот будет
+# молчать. Индустрия и казино от календаря не зависят — там порог выше.
+MIN_SCORE_BY_VERTICAL = {
+    "sports":   int(os.getenv("MIN_SCORE_SPORTS", "64")),
+    "industry": MIN_SCORE,
+    "casino":   MIN_SCORE,
+    "gaming":   MIN_SCORE,
+}
 
 POOL_SIZE     = 14   # сколько кандидатов уходит на оценку модели
 MAX_AGE_HOURS = 36   # старше — не рассматриваем
@@ -110,6 +121,17 @@ CHANNELS = {
         "lang":         "hr",
         "tz":           "Europe/Zagreb",
         "sports_focus": "football first (HNL, Dinamo, Hajduk, big European leagues), then basketball",
+        # Свои источники вместо общих (см. feeds.py). Пусто — общий пул.
+        # Index.hr: хорватский футбол, баскетбол и региональные новости.
+        # Проверено 11.09.2026: ~130 записей, картинки в content, даты есть.
+        "feeds": {
+            "sports": [
+                "https://www.index.hr/rss/sport-nogomet",
+                "https://www.index.hr/rss/sport-kosarka",
+                "https://www.index.hr/rss/sport-regija",
+                "https://www.index.hr/rss/sport",
+            ],
+        },
         "promo":        "",
         "promo_text":   "🎰 Igraj sada",
         "schedule": [
