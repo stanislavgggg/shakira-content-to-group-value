@@ -24,12 +24,22 @@ FEEDS = {
         "https://calvinayre.com/feed/",
         "https://www.gamblingnews.com/feed/",
     ],
+    # Футбол + баскетбол + хоккей. Рынки разные: LT смотрит баскетбол,
+    # LV хоккей, BG и HR футбол. Один общий пул, приоритет задаётся
+    # через sports_focus канала в config.py.
     "sports": [
-        "https://www.90min.com/posts.rss",
+        # футбол
         "https://www.theguardian.com/football/rss",
         "https://feeds.bbci.co.uk/sport/rss.xml",
-        "https://www.espn.com/espn/rss/news",
         "https://www.skysports.com/rss/12040",
+        "https://www.90min.com/posts.rss",
+        # баскетбол
+        "https://www.espn.com/espn/rss/nba/news",
+        "https://www.eurohoops.net/en/feed/",
+        # хоккей
+        "https://www.espn.com/espn/rss/nhl/news",
+        # общий
+        "https://www.espn.com/espn/rss/news",
     ],
     "gaming": [
         "https://www.pcgamer.com/rss/",
@@ -54,6 +64,7 @@ TIER = {
     "livecasino24.com":     1,
     "skysports.com":        3,
     "espn.com":             3,
+    "eurohoops.net":        3,
     "90min.com":            1,
     "theguardian.com":      3,
     "bbci.co.uk":           3,
