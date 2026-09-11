@@ -480,6 +480,21 @@ def run_slot(ch_key, vertical, do_post=True, count=None):
         return 0
 
     ranked = rank(pool, ch)
+
+    # В превью показываем всю раскладку — по ней подбирается MIN_SCORE.
+    if not do_post:
+        print(f"\n  все кандидаты ({len(ranked)}), порог {C.MIN_SCORE}:", flush=True)
+        for it in ranked:
+            mark = "✓" if it.get("score", 0) >= C.MIN_SCORE else " "
+            print(f"   {mark} {it.get('score', 0):3}  {domain(it['link']):22} "
+                  f"{it['title'][:58]:60} {it.get('why','')}", flush=True)
+        scores = [it.get("score", 0) for it in ranked]
+        if scores:
+            mid = sorted(scores)[len(scores) // 2]
+            print(f"\n  макс {max(scores)}, медиана {mid}, "
+                  f"выше порога {sum(1 for x in scores if x >= C.MIN_SCORE)}\n",
+                  flush=True)
+
     top = [it for it in ranked if it.get("score", 0) >= C.MIN_SCORE]
     log(f"    выше порога {C.MIN_SCORE}: {len(top)} из {len(ranked)}"
         f" (лучший балл {ranked[0].get('score', '-')})")
