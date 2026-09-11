@@ -65,6 +65,7 @@ TIER = {
     "skysports.com":        3,
     "espn.com":             3,
     "eurohoops.net":        3,
+    "index.hr":             3,
     "90min.com":            1,
     "theguardian.com":      3,
     "bbci.co.uk":           3,
