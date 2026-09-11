@@ -20,8 +20,11 @@ import os, re, io, json, time, random, argparse, hashlib, sys
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import warnings
 import requests, feedparser
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
+
+warnings.simplefilter("ignore", MarkupResemblesLocatorWarning)
 
 import config as C
 import feeds as F
@@ -96,18 +99,33 @@ def entry_image(e):
     return img["src"] if img and img.get("src") else None
 
 
-def og_image(url):
+def fetch_page(url):
+    """Один заход на статью: возвращает (текст, og:image).
+    Спортивные фиды дают огрызок в пару предложений — без этого
+    почти всё улетает в отсев по длине."""
     try:
-        html = requests.get(url, headers=UA, timeout=20).text[:200000]
-        soup = BeautifulSoup(html, "html.parser")
-        for prop in ("og:image", "twitter:image"):
-            t = (soup.find("meta", attrs={"property": prop})
-                 or soup.find("meta", attrs={"name": prop}))
-            if t and t.get("content", "").startswith("http"):
-                return t["content"]
+        html = requests.get(url, headers=UA, timeout=20).text[:400000]
     except Exception:
-        pass
-    return None
+        return None, None
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    image = None
+    for prop in ("og:image", "twitter:image"):
+        t = (soup.find("meta", attrs={"property": prop})
+             or soup.find("meta", attrs={"name": prop}))
+        if t and t.get("content", "").startswith("http"):
+            image = t["content"]
+            break
+
+    for tag in soup(["script", "style", "nav", "header", "footer", "aside", "form"]):
+        tag.decompose()
+    root = soup.find("article") or soup.find("main") or soup
+    paras = [p.get_text(" ", strip=True) for p in root.find_all("p")]
+    paras = [p for p in paras if len(p) > 60]
+    text = re.sub(r"\s+", " ", " ".join(paras))[:3000] or None
+
+    return text, image
 
 
 def entry_age_hours(e):
@@ -125,18 +143,21 @@ def domain(url):
 
 # ── жёсткий отсев ─────────────────────────────────────────────────
 
-def rejected(title, link, body, age):
+def rejected(title, link, age):
+    """Дешёвый отсев по заголовку/ссылке/возрасту — до любых HTTP-запросов."""
     if re.search(F.OPINION_START, title.strip(), re.I):
         return "колонка"
     if re.search(F.OPINION_PHRASE, title, re.I):
         return "колонка"
-    if re.search(r"/(opinion|editorial|column|sponsored|partner-content)/", link, re.I):
+    if re.search(r"/(opinion|editorial|column|sponsored|partner-content|live)/", link, re.I):
         return "не новость"
-    if len(body) < C.MIN_BODY:
-        return "мало текста"
     if age is not None and age > C.MAX_AGE_HOURS:
         return f"старая ({age:.0f}ч)"
     return None
+
+
+def min_body(vertical):
+    return C.MIN_BODY.get(vertical, 220) if isinstance(C.MIN_BODY, dict) else C.MIN_BODY
 
 
 # ── эвристический балл (0-10), чтобы не гонять модель по мусору ───
@@ -165,44 +186,70 @@ def heuristic(item):
 
 
 def collect(vertical, ch_key):
-    """Кандидаты по вертикали: отсев -> эвристический балл -> картинка."""
+    """Кандидаты по вертикали.
+
+    Порядок важен: сначала дешёвый отсев по заголовку, потом эвристический
+    балл, и только для верхушки — поход на страницу статьи. Так мы не жжём
+    по сто HTTP-запросов за прогон, но и не теряем новости из-за того, что
+    в RSS лежит огрызок в два предложения.
+    """
     seen = set(load_seen(ch_key))
-    raw = []
+    raw, skipped, dup = [], 0, 0
+
     for url in F.FEEDS.get(vertical, []):
         try:
             d = feedparser.parse(url, request_headers=UA)
         except Exception as ex:
             log(f"  фид недоступен {url}: {ex}")
             continue
-        for e in d.entries[:20]:
+        for e in d.entries[:25]:
             link, title = e.get("link", ""), e.get("title", "")
             if not link or not title:
                 continue
             uid = hashlib.md5((e.get("id") or link).encode()).hexdigest()[:16]
             if uid in seen:
+                dup += 1
                 continue
-            body, age = entry_body(e), entry_age_hours(e)
-            if rejected(title, link, body, age):
+            age = entry_age_hours(e)
+            if rejected(title, link, age):
+                skipped += 1
                 continue
-            raw.append({"uid": uid, "title": title, "body": body, "link": link,
-                        "age": age, "image": entry_image(e), "vertical": vertical})
+            raw.append({"uid": uid, "title": title, "body": entry_body(e),
+                        "link": link, "age": age, "image": entry_image(e),
+                        "vertical": vertical})
 
     for it in raw:
         it["h"] = heuristic(it)
     raw.sort(key=lambda x: -x["h"])
 
-    pool = []
+    need = min_body(vertical)
+    pool, enriched, thin, noimg = [], 0, 0, 0
+
     for it in raw:
         if len(pool) >= C.POOL_SIZE:
             break
-        if not it["image"]:
-            it["image"] = og_image(it["link"])
+        need_text = len(it["body"]) < need
+        need_img = not it["image"]
+
+        if (need_text or need_img) and enriched < C.ENRICH_LIMIT:
+            text, image = fetch_page(it["link"])
+            enriched += 1
+            if text and len(text) > len(it["body"]):
+                it["body"] = text
+            it["image"] = it["image"] or image
             time.sleep(0.2)
+
+        if len(it["body"]) < need:
+            thin += 1
+            continue
         if not it["image"]:
+            noimg += 1
             continue
         pool.append(it)
 
-    log(f"  [{vertical}] кандидатов {len(pool)} из {len(raw)} после отсева")
+    log(f"  [{vertical}] кандидатов {len(pool)} "
+        f"(из фидов {len(raw) + skipped + dup}, отсев {skipped}, уже было {dup}, "
+        f"дотянуто {enriched}, мало текста {thin}, без картинки {noimg})")
     return pool
 
 
@@ -231,26 +278,58 @@ def anthropic(system, user, max_tokens=1200):
 
 # ── ЭТАП 1: отбор топа ────────────────────────────────────────────
 
-RANK_SYSTEM = """You are a news editor for a casino/sports Telegram channel. You score
-candidate stories on how worth posting they are. You are strict: most feed items are
-filler and should score low.
+RANK_BASE = """You are a news editor for a Telegram channel. You score candidate
+stories on how worth posting they are. You are strict: most feed items are filler
+and should score low.
 
-Score 0-100 on newsworthiness for this audience:
-  85-100  major, concrete event the audience will talk about (big regulatory decision,
-          major acquisition, big operator launch, major match result or transfer,
-          record win, notable licence loss)
-  70-84   solid real news with a concrete fact the audience cares about
-  40-69   routine industry churn, minor appointments, small product updates
-  0-39    listicles, guides, reviews, roundups, bonus-code SEO pages, opinion,
-          re-reported old news, anything with no concrete new fact
+{rubric}
 
-Penalise heavily: no specific fact, promotional tone, "best X" framing, pure speculation.
-Reward: named parties, hard numbers, a decision that actually happened, local relevance
-to the market described in AUDIENCE.
+Penalise heavily: no specific new fact, promotional tone, "best X" framing, pure
+speculation, rumour with no source, re-reported old news.
+Reward: named parties, hard numbers, something that actually happened, and
+relevance to the market described in AUDIENCE.
 
 Return JSON only, no fences, exactly:
-{"ranked": [{"id": 1, "score": 88, "why": "six words max"}, ...]}
+{{"ranked": [{{"id": 1, "score": 88, "why": "six words max"}}, ...]}}
 Include every candidate exactly once."""
+
+RUBRIC = {
+    "sports": """Score 0-100 on how much this match/team news matters to the audience:
+  85-100  big result, derby, title-deciding match, major trophy, big-name transfer
+          done, serious injury to a star, manager sacked at a big club
+  70-84   real result or confirmed news involving a club or athlete the audience
+          follows, including their national team and the sports named in SPORTS FOCUS
+  40-69   routine fixture report, minor squad news, mid-table nobody follows
+  0-39    transfer rumour, "5 things we learned", player ratings, previews with no
+          new fact, listicles, fan-blog speculation
+Weight SPORTS FOCUS heavily: the same story is worth more if it is in the sport
+this market actually cares about.""",
+
+    "industry": """Score 0-100 on newsworthiness for an iGaming-aware audience:
+  85-100  major regulatory decision, big acquisition, licence granted or revoked,
+          large fine, market opening or closing
+  70-84   solid real news with a concrete fact — supplier deal, notable launch,
+          published financials
+  40-69   routine churn, minor appointments, small product updates
+  0-39    listicles, guides, roundups, sponsored posts, opinion""",
+
+    "casino": """Score 0-100 on how interesting this is to casino players:
+  85-100  record jackpot win, major new release from a top studio, big operator
+          launch or scandal affecting players
+  70-84   notable new slot or live game with concrete detail, real player-facing change
+  40-69   minor release, routine supplier note
+  0-39    "best slots" listicles, bonus-code SEO pages, reviews, guides""",
+
+    "gaming": """Score 0-100 on newsworthiness for a gaming audience:
+  85-100  major release, delay, studio closure, acquisition, platform-level change
+  70-84   concrete confirmed news about a game people follow
+  40-69   minor patch notes, small indie news
+  0-39    listicles, reviews, opinion, "everything we know" filler""",
+}
+
+
+def rank_system(vertical):
+    return RANK_BASE.format(rubric=RUBRIC.get(vertical, RUBRIC["industry"]))
 
 
 def rank(items, ch):
@@ -262,12 +341,14 @@ def rank(items, ch):
         age = f"{it['age']:.0f}h" if it.get("age") is not None else "?"
         lines.append(f"[{i}] ({age}, {domain(it['link'])}) {it['title']}\n"
                      f"    {it['body'][:280]}")
-    user = (f"AUDIENCE: {C.LANGS[ch['lang']][1]}. "
-            f"Sports relevance for this market: {focus}.\n\n"
+    vertical = items[0].get("vertical", "industry")
+    user = (f"AUDIENCE: {C.LANGS[ch['lang']][1]}.\n"
+            f"SPORTS FOCUS: {focus}\n\n"
             f"CANDIDATES:\n" + "\n".join(lines))
 
     try:
-        data = json.loads(anthropic(RANK_SYSTEM, user, max_tokens=1500), strict=False)
+        data = json.loads(anthropic(rank_system(vertical), user, max_tokens=1500),
+                          strict=False)
         ranked = data.get("ranked", [])
     except Exception as ex:
         log(f"    оценка не удалась ({ex}) — падаем на эвристику")
