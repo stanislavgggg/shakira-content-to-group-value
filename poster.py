@@ -186,7 +186,8 @@ def heuristic(item):
 
 
 def collect(vertical, ch_key):
-    """Кандидаты по вертикали.
+    """Кандидаты по вертикали. Если у канала задан свой список источников
+    (config.py -> "feeds"), он подменяет общий пул из feeds.py.
 
     Порядок важен: сначала дешёвый отсев по заголовку, потом эвристический
     балл, и только для верхушки — поход на страницу статьи. Так мы не жжём
@@ -196,7 +197,10 @@ def collect(vertical, ch_key):
     seen = set(load_seen(ch_key))
     raw, skipped, dup = [], 0, 0
 
-    for url in F.FEEDS.get(vertical, []):
+    own = (C.CHANNELS.get(ch_key, {}).get("feeds") or {}).get(vertical)
+    sources = own or F.FEEDS.get(vertical, [])
+
+    for url in sources:
         try:
             d = feedparser.parse(url, request_headers=UA)
         except Exception as ex:
@@ -383,13 +387,49 @@ Return JSON only, no fences, exactly:
 {{"title": "...", "body": "..."}}"""
 
 
-def rewrite(item, lang):
+def parse_post(txt):
+    """Разбор ответа модели. Кириллица весит в токенах вдвое больше латиницы,
+    и ответ иногда обрывается на середине строки — тогда вытаскиваем поля
+    регуляркой вместо того, чтобы терять новость целиком."""
+    try:
+        d = json.loads(txt, strict=False)
+        if d.get("title"):
+            return d
+    except Exception:
+        pass
+
+    t = re.search(r'"title"\s*:\s*"(.*?)(?<!\\)"', txt, re.S)
+    b = re.search(r'"body"\s*:\s*"(.*?)(?<!\\)"', txt, re.S)
+    if not t:
+        raise ValueError("в ответе нет title")
+
+    def unesc(x):
+        return x.replace('\\"', '"').replace("\\n", " ").replace("\\/", "/").strip()
+
+    title = unesc(t.group(1))
+    body = unesc(b.group(1)) if b else ""
+    if not body:
+        # тело оборвалось — обрезаем до последнего законченного предложения
+        tail = txt[txt.find('"body"'):] if '"body"' in txt else ""
+        tail = re.sub(r'^"body"\s*:\s*"', "", tail)
+        cut = max(tail.rfind("."), tail.rfind("!"), tail.rfind("?"))
+        body = unesc(tail[:cut + 1]) if cut > 40 else ""
+    return {"title": title, "body": body}
+
+
+def rewrite(item, lang, attempts=2):
     langname = C.LANGS[lang][0]
-    return json.loads(
-        anthropic(REWRITE_SYSTEM.format(langname=langname),
-                  f"HEADLINE: {item['title']}\n\nSOURCE TEXT:\n{item['body']}",
-                  max_tokens=900),
-        strict=False)
+    user = f"HEADLINE: {item['title']}\n\nSOURCE TEXT:\n{item['body']}"
+    last = None
+    for i in range(attempts):
+        try:
+            txt = anthropic(REWRITE_SYSTEM.format(langname=langname), user,
+                            max_tokens=2000)
+            return parse_post(txt)
+        except Exception as ex:
+            last = ex
+            time.sleep(1.5)
+    raise RuntimeError(last)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -469,9 +509,14 @@ def send(ch, caption, image_url):
 #  СЛОТ
 # ═══════════════════════════════════════════════════════════════════
 
+def min_score(vertical):
+    return getattr(C, "MIN_SCORE_BY_VERTICAL", {}).get(vertical, C.MIN_SCORE)
+
+
 def run_slot(ch_key, vertical, do_post=True, count=None):
     ch = C.CHANNELS[ch_key]
     count = count or C.PER_SLOT
+    thr = min_score(vertical)
     log(f"── {ch['title']} / {vertical} ──")
 
     pool = collect(vertical, ch_key)
@@ -483,20 +528,20 @@ def run_slot(ch_key, vertical, do_post=True, count=None):
 
     # В превью показываем всю раскладку — по ней подбирается MIN_SCORE.
     if not do_post:
-        print(f"\n  все кандидаты ({len(ranked)}), порог {C.MIN_SCORE}:", flush=True)
+        print(f"\n  все кандидаты ({len(ranked)}), порог {thr}:", flush=True)
         for it in ranked:
-            mark = "✓" if it.get("score", 0) >= C.MIN_SCORE else " "
+            mark = "✓" if it.get("score", 0) >= thr else " "
             print(f"   {mark} {it.get('score', 0):3}  {domain(it['link']):22} "
                   f"{it['title'][:58]:60} {it.get('why','')}", flush=True)
         scores = [it.get("score", 0) for it in ranked]
         if scores:
             mid = sorted(scores)[len(scores) // 2]
             print(f"\n  макс {max(scores)}, медиана {mid}, "
-                  f"выше порога {sum(1 for x in scores if x >= C.MIN_SCORE)}\n",
+                  f"выше порога {sum(1 for x in scores if x >= thr)}\n",
                   flush=True)
 
-    top = [it for it in ranked if it.get("score", 0) >= C.MIN_SCORE]
-    log(f"    выше порога {C.MIN_SCORE}: {len(top)} из {len(ranked)}"
+    top = [it for it in ranked if it.get("score", 0) >= thr]
+    log(f"    выше порога {thr}: {len(top)} из {len(ranked)}"
         f" (лучший балл {ranked[0].get('score', '-')})")
     if not top:
         log("    ничего топового — лучше молчать, чем лить проходняк")
@@ -514,7 +559,7 @@ def run_slot(ch_key, vertical, do_post=True, count=None):
             log(f"      перевод не удался: {ex}")
             continue
 
-        bad = audit(it["body"], cap)
+        bad = audit(f"{it['title']} {it['body']}", cap)
         if bad:
             log(f"      ПРОПУСК: числа не из источника ({', '.join(bad)})")
             continue
