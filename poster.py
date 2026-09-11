@@ -469,26 +469,34 @@ def due_slots(now_utc, fired):
     return out
 
 
+def tick():
+    """Один проход: отработать слоты, которым пора, и выйти.
+    Используется и демоном, и Railway cron."""
+    fired = load_json("fired.json", {})
+    due = due_slots(datetime.now(timezone.utc), fired)
+    if not due:
+        return 0
+    for ch_key, vertical, marker in due:
+        try:
+            run_slot(ch_key, vertical, do_post=True)
+        except Exception as ex:
+            log(f"слот {marker} упал: {ex}")
+        fired[marker] = int(time.time())
+        cutoff = int(time.time()) - 10 * 86400
+        fired = {k: v for k, v in fired.items() if v > cutoff}
+        save_json("fired.json", fired)
+    return len(due)
+
+
 def serve():
     preflight()
     log(f"старт. каналов {len(C.CHANNELS)}, "
         f"порог {C.MIN_SCORE}, state {C.STATE_DIR}"
         f"{', DRY_RUN' if C.DRY_RUN else ''}")
     plan()
-
     while True:
         try:
-            fired = load_json("fired.json", {})
-            for ch_key, vertical, marker in due_slots(datetime.now(timezone.utc), fired):
-                try:
-                    run_slot(ch_key, vertical, do_post=True)
-                except Exception as ex:
-                    log(f"слот {marker} упал: {ex}")
-                fired[marker] = int(time.time())
-                # чистим маркеры старше 10 дней
-                cutoff = int(time.time()) - 10 * 86400
-                fired = {k: v for k, v in fired.items() if v > cutoff}
-                save_json("fired.json", fired)
+            tick()
         except Exception as ex:
             log(f"цикл упал: {ex}")
         time.sleep(45)
@@ -555,6 +563,8 @@ if __name__ == "__main__":
     ap.add_argument("--preview", nargs=2, metavar=("CHANNEL", "VERTICAL"))
     ap.add_argument("--once", nargs=2, metavar=("CHANNEL", "VERTICAL"))
     ap.add_argument("--serve", action="store_true", help="демон с расписанием")
+    ap.add_argument("--tick", action="store_true",
+                    help="один проход по расписанию и выход (для Railway cron)")
     ap.add_argument("-n", type=int, default=None, help="сколько постов за прогон")
     a = ap.parse_args()
 
@@ -572,6 +582,10 @@ if __name__ == "__main__":
     elif a.once:
         preflight()
         run_slot(resolve(a.once[0]), a.once[1], do_post=True, count=a.n)
+    elif a.tick:
+        preflight()
+        n = tick()
+        log(f"слотов отработано: {n}")
     elif a.serve:
         serve()
     else:
